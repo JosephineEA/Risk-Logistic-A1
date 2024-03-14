@@ -1,0 +1,345 @@
+model "The 3-Echelon Multi-period Warehouse Location Problem"
+  uses "mmsystem", "mmjobs"
+
+forward function computeTotalCost(Y: array(range) of integer) : real
+
+! ============================================================================
+! Reading problem parameters
+! ============================================================================
+filename := "CaseStudyData.txt";
+!filename := "CaseStudyDataAggregated.txt"
+
+! ============  various part 1: numbers  ============== !
+declarations
+  ! Number of postcode districts  # 440
+  nbCustomers: integer
+  ! Number of potantial locations   # 440
+  nbLocations: integer
+  ! Number of suppliers  #  53
+  nbSuppliers: integer
+  ! Number of product groups  # 4
+  nbProductGroups: integer
+  ! Number of vehicle types  # 3: 1 <- 18t; 2 <- 7.5t; 3 <- 3.5t
+  nbVehicleTypes: integer
+  ! Number of periods  #  10
+  nbPeriods: integer
+end-declarations
+
+! Read the various numbers from the file
+initializations from filename
+  nbCustomers nbSuppliers nbProductGroups nbVehicleTypes
+end-initializations
+
+! All districts are potential locations
+nbLocations := nbCustomers
+
+! 10 periods
+nbPeriods := 10
+
+! ============  various part 2: index-vetor  ============== !
+declarations
+  ! Set of potential locations
+  Locations = 1..nbLocations
+  ! Set of customers
+  Customers = 1..nbCustomers
+  ! Set of suppliers
+  Suppliers = 1..nbSuppliers
+  ! Set of product groups
+  Products = 1..nbProductGroups
+  ! Set of vehicle types
+  Vehicles = 1..nbVehicleTypes
+  ! Set of periods
+  Periods = 1..nbPeriods
+
+  ! Vector of district ids
+  CustomerId: array(Customers) of string
+  ! Vectors of district coordinates
+  CustomerEasting: array(Customers) of real
+  CustomerNorthing: array(Customers) of real
+  ! The annual district demand in kilograms per product group and period
+  Demand: array(Customers, Products, Periods) of real
+  ! Total demand per product group
+  total_demand: array(Products) of real
+
+  ! Vector of supplier ids
+  SupplierId: array(Suppliers) of integer
+  ! Vectors of supplier coordinates
+  SupplierEasting: array(Customers) of real
+  SupplierNorthing: array(Customers) of real
+  ! Vector of supplier product groups; recall that each supplier only provides one product group
+  SupplierProductGroup: array(Suppliers) of integer
+  ! Vector of supplier capacity given in kilograms per year # IGNORE
+  SupplierCapacity: array(Suppliers) of real
+  ! Vector of supplier vehicle types
+  SupplierVehicleType: array(Suppliers) of integer
+
+  ! Setup costs for warehouses and cross-docks
+  SetupWarehouses: array(Locations) of integer
+  OperatingWarehouses: array(Locations) of integer
+
+  ! USE DISTANE COMPUTE COSTS
+  ! Distance matrix between customers and locations in miles
+  Distance: array(Customers,Locations) of real
+  ! Distance matrix between locations and suppliers in miles
+  DistanceSupplier: array(Locations,Suppliers) of real
+  ! Matrix of transportation costs between customers and locations
+  Cost: array(Customers,Locations) of real
+  ! Matrix of transportation costs between locations and suppliers
+  CostSupplier: array(Locations,Suppliers) of real
+
+  ! Vehicle related data. The vehicles are indexed 1, 2, and 3, where 1 stands
+  ! for 18t trucks, 2 for 7.5t lorries, and 3 for 3.5t vans.
+  ! The vehicle capacity in tonnes  # IGNORE
+  VehicleCapacity: array(Vehicles) of real
+  ! The overall cost in pounds per mile travelled
+  VehicleCostPerMileOverall: array(Vehicles) of real
+  ! The overall cost in pounds per mile and tonne transported
+  VehicleCostPerMileAndTonneOverall: array(Vehicles) of real
+  ! The CO2 emission in kilograms per mile and tonne transported  # IGNORE
+  VehicleCO2PerMileAndTonne: array(Vehicles) of real
+
+  ! The time period when a facility was constructed, nbPeriods + 1 if never built
+  Y: array(Locations) of integer
+  ! The vector of customer allocations # at t period customer arrage product k to X Warehouse (value is warehouse's location)
+  X: array(Customers,Products,Periods) of integer
+  ! The vector of supplier allocations      # k products of l warehouse aloocate to z suppliers (value is suppliers)
+  Z: array(Locations,Products) of integer
+  ! A set for the omega rule
+  Omega, OmegaRule: set of integer
+end-declarations
+
+! Read data
+initializations from filename
+  CustomerId CustomerEasting CustomerNorthing
+  SetupWarehouses OperatingWarehouses
+  SupplierId SupplierProductGroup SupplierCapacity SupplierVehicleType
+  SupplierEasting SupplierNorthing
+  VehicleCapacity VehicleCostPerMileOverall VehicleCostPerMileAndTonneOverall
+  VehicleCO2PerMileAndTonne
+  Demand as "CustomerDemand"
+  Distance as "DistanceLocationCustomer"
+  DistanceSupplier as "DistanceLocationSupplier"
+end-initializations
+
+starttime := gettime
+! # Location: j; Suppliers: s; Year:t, Product: k Customer: c
+! ==================================================================================================
+! Data preparation
+! ==================================================================================================
+
+! Transports between suppliers and locations use either 7.5t or 18t trucks, depending on the
+! vehicle type. Make sure to convert from tonne to kilogram. # how many to pay for each kg
+! --------------------------------------------------------------------------------------------------
+forall(j in Locations, s in Suppliers) do
+  if(SupplierVehicleType(s) = 1) then
+    CostSupplier(j,s) := DistanceSupplier(j,s) * VehicleCostPerMileAndTonneOverall(1) / 1000
+  else
+    CostSupplier(j,s) := DistanceSupplier(j,s) * VehicleCostPerMileAndTonneOverall(2) / 1000
+  end-if
+end-do
+
+! Transports between locations and customers use 3.5t vans.
+! Make sure to convert from tonne to kilogram. # how many pounds to pay for each kg
+! --------------------------------------------------------------------------------------------------
+forall(i,j in Locations)
+  Cost(i,j) := Distance(i,j) * VehicleCostPerMileAndTonneOverall(3) / 1000
+
+! # ============= The starting solutions for Q3 ============ # !
+! Initialize Y (nbLocations := nbCustomers)
+
+! # ======= Selected locations as starting solution ======= #
+! forall(j in Locations) do
+!   if(CustomerId(j) = "DG1") then
+!     Y(j) := 1
+!   elif(CustomerId(j) = "G12") then
+!     Y(j) := 3
+!   elif(CustomerId(j) = "IV36") then
+!     Y(j) := 5
+!   elif(CustomerId(j) = "ML8") then
+!     Y(j) := 7
+!   elif(CustomerId(j) = "PH17") then
+!     Y(j) := 9
+!   else
+!     Y(j) := nbPeriods + 1
+!   end-if
+! end-do
+
+! # ======= The ouput of Q2 as starting solution ======= #
+forall(j in Locations) do
+  if(CustomerId(j) = "AB10") then
+     Y(j) := 1
+  else
+     Y(j) := nbPeriods + 1
+  end-if
+end-do
+
+! ==================================================================================================
+! Compute the total transportation cost for a given set of facilities
+! ==================================================================================================
+function computeTotalCost(Y: array(range) of integer) : real
+  ! ----- set-up costs + operational costs ---- !
+  declarations
+    total_setup: real
+    total_operating:real
+  end-declarations
+
+  forall(j in Locations) do
+    if(Y(j) <= nbPeriods) then
+      total_setup += SetupWarehouses(j)
+      total_operating += (nbPeriods + 1 - Y(j))*OperatingWarehouses(j)
+    end-if
+  end-do
+
+  ! --------------- transportation casts --------------- !
+  declarations
+    total_trans: real
+    current_trans_supplier: real ! initializations as a big number
+    current_trans: real
+    weight_supplier: array(Locations,Suppliers) of real! correspond to CostSuppliers
+    weight: array(Customers,Locations,Products) of real ! correspond to Cost
+  end-declarations
+
+  ! --------------- transportation casts Warehouse to Customers --------------- !
+  forall(t in Periods) do
+    forall(i in Customers) do
+      current_trans := 100000 !max(d in Distance) d !!!!!!!!!!!!! remember to check
+      forall(j in Locations) do ! locate which y
+        if(Y(j) <=t and Distance(i,j) <= current_trans) then
+          forall(k in Products) do
+            X(i,k,t) := j
+            weight(i,j,k) := Demand(i,k,t) ! add the weight need to transfer from j to i
+            current_trans := Distance(i,j)
+          end-do
+        else
+          forall(k in Products) do
+            weight(i,j,k) := 0
+            X(i,k,t) := 0
+           end-do
+        end-if
+      end-do
+    end-do
+  end-do
+
+  forall(i,j in Locations) total_trans := sum(k in Products)weight(i,j,k)*Cost(i,j)
+
+  ! --------------- transportation costs Supplier to Warehouse --------------- !
+
+  forall(t in Periods) do ! at t period
+    forall(j in Locations) do ! for j warehouse
+      if(Y(j) <= t) then
+        current_trans_supplier := 10000 !max(d in DistanceSupplier) d !!!!!!!!!!!!! remember to check
+        forall(s in Suppliers) do ! for s Suppliers
+          forall(k in Products) do ! for k Products
+            if(SupplierProductGroup(s) = k and DistanceSupplier(j,s) <= current_trans_supplier) then ! evaluate if this supplier can support this product
+              Z(j,k) := s
+              current_trans_supplier := DistanceSupplier(j,s)
+              weight_supplier(j,s) := weight_supplier(j,s) + sum(i in Customers) weight(i,j,k)
+            else
+              Z(j,k) := 0
+              weight_supplier(j,s) := 0
+            end-if
+          end-do
+        end-do
+      end-if
+    end-do
+  end-do
+
+
+
+  total_trans := total_trans +  sum(j in Locations,s in Suppliers) (weight_supplier(j,s)*CostSupplier(j,s))
+
+
+  returned := total_setup + total_operating + total_trans
+
+
+  ! --------------- sum up --------------- !
+  returned := total_setup + total_operating + total_trans
+
+end-function
+writeln(computeTotalCost(Y))
+
+! ==================================================================================================
+! Interchange
+! ==================================================================================================
+
+declarations
+  Y_bi: array(Locations, Periods) of integer
+  Yp: array(Locations) of integer
+  Yp_bi: array(Locations, Periods) of integer
+end-declarations
+
+forall(j in Locations, t in Periods) do
+  if(Y(j) = t) then 
+    Y_bi(j,t) := 1
+  else Y_bi(j,t) := 0
+  end-if
+end-do
+
+! Save the cost of the starting solution
+best_cost := computeTotalCost(Y);
+writeln("The original total cost is ", best_cost)
+! Iterations
+! ==================================================================================================
+improvement_found := true
+Yp := Y
+Yp_bi := Y_bi
+
+! Iterate as long as we can improve the solution
+while(improvement_found) do
+
+  ! Set the control parameter to false
+  improvement_found := false
+  ! ------------------------------------------------------------------------------------------------
+  ! Explore the exchange neigborhood
+  ! ------------------------------------------------------------------------------------------------
+    ! Go over all locations in the solution
+  forall(j in Locations) do
+    if(Y(j) < nbPeriods + 1) then
+      t := Y(j)
+    ! Go over all locations in the neighborhood
+      forall(l in Locations - {j}) do
+        if(sum(p in Periods) Y_bi(l,p) = 0 and Distance(j,l) <= 200) then
+
+          ! Derive the neighboring solution ...
+          Yp(j) := nbPeriods + 1
+          Yp_bi(j,t) := 0
+          Yp(l) := t
+          Yp_bi(l,t) := 1
+          ! ... and compute its cost
+          cost := computeTotalCost(Yp)
+          ! Is this neighboring solution better?
+          ! If yes, then replace the previous solution and start from the beginning
+          if(cost < best_cost) then
+            ! Save cost and set flag
+            best_cost := cost
+            improvement_found := true
+            Y := Yp;
+            Y_bi := Yp_bi
+            break 2
+
+          end-if
+        end-if
+      end-do
+    end-if
+  end-do
+
+  if(not improvement_found) then
+    writeln("No improving pair found -> STOP")
+  end-if
+
+end-do
+
+writeln("After the interchange heuristic, the total cost is ", best_cost)
+
+writeln("The final set of solutions is: ")
+forall(j in Locations) do
+  forall(p in Periods) do
+    if (Y_bi(j,p) = 1) then
+      writeln("Y(", CustomerId(j), ") = ", p)
+    end-if
+  end-do
+end-do
+
+endtime := gettime
+writeln("time:","   ",(gettime-starttime) - (gettime-endtime))
+end-model
